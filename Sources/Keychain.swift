@@ -113,6 +113,25 @@ public final class Keychain {
 private let kOTPService = "me.mattrubin.onetimepassword.token"
 private let urlStringEncoding = String.Encoding.utf8
 
+/// The UserDefaults key marking that legacy file-based keychain tokens have been
+/// migrated to the data protection keychain (macOS only, see `dataProtectionKeychainQuery`).
+private let didMigrateTokensToDataProtectionKeychainKey = "OneTimePassword.didMigrateTokensToDataProtectionKeychain"
+
+/// On macOS, routes a keychain query to the data protection keychain — where access is
+/// controlled by the app's Team ID / keychain-access-group rather than by the app's code
+/// signature. This keeps tokens accessible after the app is re-signed with a different
+/// distribution certificate (e.g. switching between App Store and Developer ID builds).
+/// On iOS this is already the only keychain, so the flag is a no-op and is omitted.
+private func dataProtectionKeychainQuery(_ query: [String: AnyObject]) -> [String: AnyObject] {
+    #if os(OSX)
+    var query = query
+    query[kSecUseDataProtectionKeychain as String] = kCFBooleanTrue
+    return query
+    #else
+    return query
+    #endif
+}
+
 private extension Token {
     func keychainAttributes() throws -> [String: AnyObject] {
         let url = try self.toURL()
@@ -163,6 +182,7 @@ private func addKeychainItem(withAttributes attributes: [String: AnyObject]) thr
     if mutableAttributes[kSecAttrAccount as String] == nil {
         mutableAttributes[kSecAttrAccount as String] = UUID().uuidString as NSString
     }
+    mutableAttributes = dataProtectionKeychainQuery(mutableAttributes)
 
     var result: AnyObject?
     let resultCode: OSStatus = withUnsafeMutablePointer(to: &result) {
@@ -180,10 +200,10 @@ private func addKeychainItem(withAttributes attributes: [String: AnyObject]) thr
 
 private func updateKeychainItem(forPersistentRef persistentRef: Data,
                                 withAttributes attributesToUpdate: [String: AnyObject]) throws {
-    let queryDict: [String: AnyObject] = [
+    let queryDict = dataProtectionKeychainQuery([
         kSecClass as String:               kSecClassGenericPassword,
         kSecValuePersistentRef as String:  persistentRef as NSData,
-    ]
+    ])
 
     let resultCode = SecItemUpdate(queryDict as CFDictionary, attributesToUpdate as CFDictionary)
 
@@ -193,10 +213,10 @@ private func updateKeychainItem(forPersistentRef persistentRef: Data,
 }
 
 private func deleteKeychainItem(forPersistentRef persistentRef: Data) throws {
-    let queryDict: [String: AnyObject] = [
+    let queryDict = dataProtectionKeychainQuery([
         kSecClass as String:               kSecClassGenericPassword,
         kSecValuePersistentRef as String:  persistentRef as NSData,
-    ]
+    ])
 
     let resultCode = SecItemDelete(queryDict as CFDictionary)
 
@@ -206,14 +226,14 @@ private func deleteKeychainItem(forPersistentRef persistentRef: Data) throws {
 }
 
 private func keychainItem(forPersistentRef persistentRef: Data) throws -> NSDictionary? {
-    let queryDict: [String: AnyObject] = [
+    let queryDict = dataProtectionKeychainQuery([
         kSecClass as String:                kSecClassGenericPassword,
         kSecValuePersistentRef as String:   persistentRef as NSData,
         kSecReturnPersistentRef as String:  kCFBooleanTrue,
         kSecReturnAttributes as String:     kCFBooleanTrue,
         kSecReturnData as String:           kCFBooleanTrue,
         kSecAttrService as String:          kOTPService as NSString,
-    ]
+    ])
 
     var result: AnyObject?
     let resultCode = withUnsafeMutablePointer(to: &result) {
@@ -240,15 +260,19 @@ private func allKeychainItems() throws -> [NSDictionary] {
         #endif
         return false
     }()
-    
-    let queryDict: [String: AnyObject] = [
+
+    #if os(OSX)
+    migrateLegacyItemsToDataProtectionKeychainIfNeeded()
+    #endif
+
+    let queryDict = dataProtectionKeychainQuery([
         kSecClass as String:                kSecClassGenericPassword,
         kSecMatchLimit as String:           kSecMatchLimitAll,
         kSecReturnPersistentRef as String:  kCFBooleanTrue,
         kSecReturnAttributes as String:     kCFBooleanTrue,
         kSecReturnData as String:           isMac ? kCFBooleanFalse : kCFBooleanTrue,
         kSecAttrService as String:          kOTPService as NSString,
-    ]
+    ])
 
     var result: AnyObject?
     let resultCode = withUnsafeMutablePointer(to: &result) {
@@ -273,3 +297,139 @@ private func allKeychainItems() throws -> [NSDictionary] {
     }
     return keychainItems
 }
+
+#if os(OSX)
+
+// MARK: - Legacy keychain migration (macOS)
+
+private let migrationLock = NSLock()
+
+/// Copies OTP tokens saved by previous versions in the legacy file-based keychain into
+/// the data protection keychain. Runs once (tracked in UserDefaults) and only in the main
+/// app, since extensions can't read the legacy items created by the app itself.
+private func migrateLegacyItemsToDataProtectionKeychainIfNeeded() {
+    migrationLock.lock()
+    defer { migrationLock.unlock() }
+
+    let defaults = UserDefaults.standard
+    guard !defaults.bool(forKey: didMigrateTokensToDataProtectionKeychainKey) else {
+        return
+    }
+    guard Bundle.main.bundleURL.pathExtension != "appex" else {
+        return
+    }
+
+    let (refsStatus, legacyRefs) = legacyKeychainRefs()
+    if refsStatus == errSecItemNotFound {
+        // Nothing stored in the legacy keychain — mark as migrated and stop checking.
+        defaults.set(true, forKey: didMigrateTokensToDataProtectionKeychainKey)
+        return
+    }
+    guard refsStatus == errSecSuccess else {
+        return
+    }
+
+    let migratedItems = dataProtectionKeychainItems()
+    var migratedAllItems = true
+    for ref in legacyRefs {
+        // Reading the secret of an item created by a build signed with a different
+        // certificate triggers the system permission prompt.
+        guard let item = legacyKeychainItem(forPersistentRef: ref) else {
+            // The read failed (e.g. the user denied the system keychain prompt). Keep the
+            // flag unset so this item is retried on a later launch.
+            migratedAllItems = false
+            continue
+        }
+        guard let generic = item[kSecAttrGeneric as String] as? Data,
+              let secret = item[kSecValueData as String] as? Data else {
+            continue
+        }
+        // Skip tokens already present in the data protection keychain so retries after a
+        // partial failure don't create duplicates. Tokens are compared by both the URL and
+        // the secret: tokens re-added for the same account can share the same URL.
+        let alreadyMigrated = migratedItems.contains { migrated in
+            migrated[kSecAttrGeneric as String] as? Data == generic
+                && migrated[kSecValueData as String] as? Data == secret
+        }
+        if alreadyMigrated {
+            continue
+        }
+        let attributes: [String: AnyObject] = [
+            kSecAttrGeneric as String: generic as NSData,
+            kSecValueData as String:   secret as NSData,
+            kSecAttrService as String: kOTPService as NSString,
+        ]
+        do {
+            _ = try addKeychainItem(withAttributes: attributes)
+        } catch {
+            migratedAllItems = false
+        }
+    }
+    // Only mark migration complete once every token has been copied, so a denied prompt or
+    // a transient failure doesn't permanently leave some tokens behind in the legacy keychain.
+    if migratedAllItems {
+        defaults.set(true, forKey: didMigrateTokensToDataProtectionKeychainKey)
+    }
+}
+
+/// Reads the persistent refs of all OTP tokens stored in the legacy file-based keychain
+/// (without the data protection flag). Returns the raw `SecItemCopyMatching` status so
+/// callers can tell "no items" apart from a failed read. Fetching refs doesn't require
+/// access to the items' secrets, so this never triggers the system permission prompt —
+/// only the per-item secret reads do.
+private func legacyKeychainRefs() -> (status: OSStatus, refs: [Data]) {
+    let refsQuery: [String: AnyObject] = [
+        kSecClass as String:               kSecClassGenericPassword,
+        kSecMatchLimit as String:          kSecMatchLimitAll,
+        kSecReturnPersistentRef as String: kCFBooleanTrue,
+        kSecAttrService as String:         kOTPService as NSString,
+    ]
+    var result: AnyObject?
+    let status = withUnsafeMutablePointer(to: &result) {
+        SecItemCopyMatching(refsQuery as CFDictionary, $0)
+    }
+    guard status == errSecSuccess, let refs = result as? [Data] else {
+        return (status, [])
+    }
+    return (status, refs)
+}
+
+private func legacyKeychainItem(forPersistentRef persistentRef: Data) -> NSDictionary? {
+    let queryDict: [String: AnyObject] = [
+        kSecClass as String:               kSecClassGenericPassword,
+        kSecValuePersistentRef as String:  persistentRef as NSData,
+        kSecReturnAttributes as String:    kCFBooleanTrue,
+        kSecReturnData as String:          kCFBooleanTrue,
+        kSecAttrService as String:         kOTPService as NSString,
+    ]
+    var result: AnyObject?
+    let status = withUnsafeMutablePointer(to: &result) {
+        SecItemCopyMatching(queryDict as CFDictionary, $0)
+    }
+    guard status == errSecSuccess else {
+        return nil
+    }
+    return result as? NSDictionary
+}
+
+/// All items already stored in the data protection keychain, used to detect
+/// already-migrated tokens. Refs are fetched first and each item read individually,
+/// matching the macOS `errSecParam` workaround in `allKeychainItems`.
+private func dataProtectionKeychainItems() -> [NSDictionary] {
+    let refsQuery = dataProtectionKeychainQuery([
+        kSecClass as String:               kSecClassGenericPassword,
+        kSecMatchLimit as String:          kSecMatchLimitAll,
+        kSecReturnPersistentRef as String: kCFBooleanTrue,
+        kSecAttrService as String:         kOTPService as NSString,
+    ])
+    var result: AnyObject?
+    let status = withUnsafeMutablePointer(to: &result) {
+        SecItemCopyMatching(refsQuery as CFDictionary, $0)
+    }
+    guard status == errSecSuccess, let refs = result as? [Data] else {
+        return []
+    }
+    return refs.compactMap { try? keychainItem(forPersistentRef: $0) }
+}
+
+#endif
