@@ -262,7 +262,9 @@ private func allKeychainItems() throws -> [NSDictionary] {
     }()
 
     #if os(OSX)
-    migrateLegacyItemsToDataProtectionKeychainIfNeeded()
+    // Silent attempt only: items requiring the system permission prompt are skipped here
+    // and migrated later via `Keychain.migrateLegacyTokens()`.
+    migrateLegacyItemsToDataProtectionKeychainIfNeeded(allowUserInteraction: false)
     #endif
 
     let queryDict = dataProtectionKeychainQuery([
@@ -302,12 +304,36 @@ private func allKeychainItems() throws -> [NSDictionary] {
 
 // MARK: - Legacy keychain migration (macOS)
 
+extension Keychain {
+    /// Whether some legacy tokens are still waiting to be migrated to the data protection
+    /// keychain and the system will show permission prompts for them. A silent migration is
+    /// attempted first, so this returns `true` only when the remaining items can't be read
+    /// without the user's approval (e.g. after a distribution channel switch).
+    public static func legacyMigrationNeedsUserApproval() -> Bool {
+        migrateLegacyItemsToDataProtectionKeychainIfNeeded(allowUserInteraction: false)
+        return !UserDefaults.standard.bool(forKey: didMigrateTokensToDataProtectionKeychainKey)
+    }
+
+    /// Migrates the remaining legacy tokens, allowing the system permission prompts (one per
+    /// token). Returns `true` once every legacy token has been migrated. Call
+    /// `legacyMigrationNeedsUserApproval()` first and warn the user about the prompts.
+    @discardableResult
+    public static func migrateLegacyTokens() -> Bool {
+        migrateLegacyItemsToDataProtectionKeychainIfNeeded(allowUserInteraction: true)
+        return UserDefaults.standard.bool(forKey: didMigrateTokensToDataProtectionKeychainKey)
+    }
+}
+
 private let migrationLock = NSLock()
 
 /// Copies OTP tokens saved by previous versions in the legacy file-based keychain into
 /// the data protection keychain. Runs once (tracked in UserDefaults) and only in the main
 /// app, since extensions can't read the legacy items created by the app itself.
-private func migrateLegacyItemsToDataProtectionKeychainIfNeeded() {
+///
+/// With `allowUserInteraction: false` the system permission prompts are suppressed:
+/// items created by a build signed with a different certificate are skipped and retried
+/// later, so app startup never blocks on keychain dialogs.
+private func migrateLegacyItemsToDataProtectionKeychainIfNeeded(allowUserInteraction: Bool) {
     migrationLock.lock()
     defer { migrationLock.unlock() }
 
@@ -327,6 +353,17 @@ private func migrateLegacyItemsToDataProtectionKeychainIfNeeded() {
     }
     guard refsStatus == errSecSuccess else {
         return
+    }
+
+    if !allowUserInteraction {
+        // Deprecated along with the rest of the legacy keychain API, but it's the only way
+        // to read legacy items without triggering the system permission prompts.
+        SecKeychainSetUserInteractionAllowed(false)
+    }
+    defer {
+        if !allowUserInteraction {
+            SecKeychainSetUserInteractionAllowed(true)
+        }
     }
 
     let migratedItems = dataProtectionKeychainItems()
