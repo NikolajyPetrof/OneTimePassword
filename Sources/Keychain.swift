@@ -254,25 +254,23 @@ private func keychainItem(forPersistentRef persistentRef: Data) throws -> NSDict
 }
 
 private func allKeychainItems() throws -> [NSDictionary] {
-    let isMac: Bool = {
-        #if os(OSX)
-        return true
-        #endif
-        return false
-    }()
-
     #if os(OSX)
     // Silent attempt only: items requiring the system permission prompt are skipped here
     // and migrated later via `Keychain.migrateLegacyTokens()`.
     migrateLegacyItemsToDataProtectionKeychainIfNeeded(allowUserInteraction: false)
     #endif
 
+    return try dataProtectionKeychainItems()
+}
+
+/// Reads all OTP tokens stored in the data protection keychain.
+private func dataProtectionKeychainItems() throws -> [NSDictionary] {
     let queryDict = dataProtectionKeychainQuery([
         kSecClass as String:                kSecClassGenericPassword,
         kSecMatchLimit as String:           kSecMatchLimitAll,
         kSecReturnPersistentRef as String:  kCFBooleanTrue,
         kSecReturnAttributes as String:     kCFBooleanTrue,
-        kSecReturnData as String:           isMac ? kCFBooleanFalse : kCFBooleanTrue,
+        kSecReturnData as String:           kCFBooleanTrue,
         kSecAttrService as String:          kOTPService as NSString,
     ])
 
@@ -285,17 +283,19 @@ private func allKeychainItems() throws -> [NSDictionary] {
         // Not finding any keychain items is not an error in this case. Return an empty array.
         return []
     }
+    #if os(OSX)
+    if resultCode == errSecParam {
+        // Some macOS configurations fail batch reads that include kSecValueData with
+        // errSecParam — fall back to fetching refs and reading the items one by one.
+        migrationLog("batch items read failed with errSecParam, falling back to per-ref reads")
+        return dataProtectionKeychainItemsByRefs()
+    }
+    #endif
     guard resultCode == errSecSuccess else {
         throw Keychain.Error.systemError(resultCode)
     }
     guard let keychainItems = result as? [NSDictionary] else {
         throw Keychain.Error.incorrectReturnType
-    }
-    //small macos workaround that fixes `errSecParam` error
-    if isMac {
-        return keychainItems
-            .compactMap { item in item[kSecValuePersistentRef] as? Data }
-            .compactMap { data in try? keychainItem(forPersistentRef: data) }
     }
     return keychainItems
 }
@@ -311,7 +311,9 @@ extension Keychain {
     /// without the user's approval (e.g. after a distribution channel switch).
     public static func legacyMigrationNeedsUserApproval() -> Bool {
         migrateLegacyItemsToDataProtectionKeychainIfNeeded(allowUserInteraction: false)
-        return !UserDefaults.standard.bool(forKey: didMigrateTokensToDataProtectionKeychainKey)
+        let needsApproval = !UserDefaults.standard.bool(forKey: didMigrateTokensToDataProtectionKeychainKey)
+        migrationLog("needsUserApproval: \(needsApproval)")
+        return needsApproval
     }
 
     /// Migrates the remaining legacy tokens, allowing the system permission prompts (one per
@@ -320,7 +322,9 @@ extension Keychain {
     @discardableResult
     public static func migrateLegacyTokens() -> Bool {
         migrateLegacyItemsToDataProtectionKeychainIfNeeded(allowUserInteraction: true)
-        return UserDefaults.standard.bool(forKey: didMigrateTokensToDataProtectionKeychainKey)
+        let migrated = UserDefaults.standard.bool(forKey: didMigrateTokensToDataProtectionKeychainKey)
+        migrationLog("migrateLegacyTokens result: \(migrated)")
+        return migrated
     }
 }
 
@@ -348,12 +352,15 @@ private func migrateLegacyItemsToDataProtectionKeychainIfNeeded(allowUserInterac
     let (refsStatus, legacyRefs) = legacyKeychainRefs()
     if refsStatus == errSecItemNotFound {
         // Nothing stored in the legacy keychain — mark as migrated and stop checking.
+        migrationLog("no legacy items found, marking migration as done")
         defaults.set(true, forKey: didMigrateTokensToDataProtectionKeychainKey)
         return
     }
     guard refsStatus == errSecSuccess else {
+        migrationLog("legacy refs query failed, status: \(refsStatus)")
         return
     }
+    migrationLog("start, allowUserInteraction: \(allowUserInteraction), legacy items: \(legacyRefs.count)")
 
     if !allowUserInteraction {
         // Deprecated along with the rest of the legacy keychain API, but it's the only way
@@ -366,19 +373,30 @@ private func migrateLegacyItemsToDataProtectionKeychainIfNeeded(allowUserInterac
         }
     }
 
-    let migratedItems = dataProtectionKeychainItems()
+    let migratedItems = (try? dataProtectionKeychainItems()) ?? []
+    migrationLog("items already in data protection keychain: \(migratedItems.count)")
     var migratedAllItems = true
-    for ref in legacyRefs {
+    for (index, ref) in legacyRefs.enumerated() {
         // Reading the secret of an item created by a build signed with a different
         // certificate triggers the system permission prompt.
-        guard let item = legacyKeychainItem(forPersistentRef: ref) else {
-            // The read failed (e.g. the user denied the system keychain prompt). Keep the
-            // flag unset so this item is retried on a later launch.
-            migratedAllItems = false
+        let (readStatus, readItem) = legacyKeychainItem(forPersistentRef: ref)
+        guard let item = readItem else {
+            if readStatus == errSecParam {
+                // The flag-less refs query can also return data protection keychain items,
+                // whose refs the legacy engine can't parse (errSecParam). They already live
+                // in the new keychain, so they don't need migration and don't block it.
+                migrationLog("item \(index): not a legacy item, skipping")
+            } else {
+                // The read failed (e.g. the user denied the system keychain prompt). Keep
+                // the flag unset so this item is retried on a later launch.
+                migrationLog("item \(index): read failed, status: \(readStatus)")
+                migratedAllItems = false
+            }
             continue
         }
         guard let generic = item[kSecAttrGeneric as String] as? Data,
               let secret = item[kSecValueData as String] as? Data else {
+            migrationLog("item \(index): missing generic or secret, skipping")
             continue
         }
         // Skip tokens already present in the data protection keychain so retries after a
@@ -389,6 +407,7 @@ private func migrateLegacyItemsToDataProtectionKeychainIfNeeded(allowUserInterac
                 && migrated[kSecValueData as String] as? Data == secret
         }
         if alreadyMigrated {
+            migrationLog("item \(index): already migrated, skipping")
             continue
         }
         let attributes: [String: AnyObject] = [
@@ -398,12 +417,15 @@ private func migrateLegacyItemsToDataProtectionKeychainIfNeeded(allowUserInterac
         ]
         do {
             _ = try addKeychainItem(withAttributes: attributes)
+            migrationLog("item \(index): migrated")
         } catch {
+            migrationLog("item \(index): add failed, error: \(error)")
             migratedAllItems = false
         }
     }
     // Only mark migration complete once every token has been copied, so a denied prompt or
     // a transient failure doesn't permanently leave some tokens behind in the legacy keychain.
+    migrationLog("finished, migratedAllItems: \(migratedAllItems)")
     if migratedAllItems {
         defaults.set(true, forKey: didMigrateTokensToDataProtectionKeychainKey)
     }
@@ -431,7 +453,7 @@ private func legacyKeychainRefs() -> (status: OSStatus, refs: [Data]) {
     return (status, refs)
 }
 
-private func legacyKeychainItem(forPersistentRef persistentRef: Data) -> NSDictionary? {
+private func legacyKeychainItem(forPersistentRef persistentRef: Data) -> (status: OSStatus, item: NSDictionary?) {
     let queryDict: [String: AnyObject] = [
         kSecClass as String:               kSecClassGenericPassword,
         kSecValuePersistentRef as String:  persistentRef as NSData,
@@ -444,15 +466,14 @@ private func legacyKeychainItem(forPersistentRef persistentRef: Data) -> NSDicti
         SecItemCopyMatching(queryDict as CFDictionary, $0)
     }
     guard status == errSecSuccess else {
-        return nil
+        return (status, nil)
     }
-    return result as? NSDictionary
+    return (status, result as? NSDictionary)
 }
 
-/// All items already stored in the data protection keychain, used to detect
-/// already-migrated tokens. Refs are fetched first and each item read individually,
-/// matching the macOS `errSecParam` workaround in `allKeychainItems`.
-private func dataProtectionKeychainItems() -> [NSDictionary] {
+/// Fallback for `dataProtectionKeychainItems()`: fetches the persistent refs first and
+/// reads each item individually.
+private func dataProtectionKeychainItemsByRefs() -> [NSDictionary] {
     let refsQuery = dataProtectionKeychainQuery([
         kSecClass as String:               kSecClassGenericPassword,
         kSecMatchLimit as String:          kSecMatchLimitAll,
@@ -464,6 +485,9 @@ private func dataProtectionKeychainItems() -> [NSDictionary] {
         SecItemCopyMatching(refsQuery as CFDictionary, $0)
     }
     guard status == errSecSuccess, let refs = result as? [Data] else {
+        if status != errSecItemNotFound {
+            migrationLog("data protection refs query failed, status: \(status)")
+        }
         return []
     }
     return refs.compactMap { try? keychainItem(forPersistentRef: $0) }
